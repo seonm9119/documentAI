@@ -1,24 +1,16 @@
-import html
 import json
-import re
 from pathlib import Path
 
 
 AXES = ("subject", "document_type", "business_domain", "modifier")
 
 
-def ocr_page_jsons_to_model_text(deepseek_pages, paddle_pages):
-    deepseek_page_payloads = load_json_pages(deepseek_pages, "deepseek_pages")
+def paddle_page_jsons_to_model_text(paddle_pages):
     paddle_page_payloads = load_json_pages(paddle_pages, "paddle_pages")
-
-    if len(deepseek_page_payloads) != len(paddle_page_payloads):
-        raise ValueError("deepseek_pages와 paddle_pages의 page 수가 같아야 합니다.")
-
     page_texts = []
-    for deepseek_page_payload, paddle_page_payload in zip(deepseek_page_payloads, paddle_page_payloads):
-        deepseek_text = extract_deepseek_text(deepseek_page_payload)
+    for paddle_page_payload in paddle_page_payloads:
         paddle_text = extract_paddle_text(paddle_page_payload)
-        page_texts.append(build_ocr_page_text(deepseek_text, paddle_text))
+        page_texts.append(paddle_text)
 
     return merge_raw_texts(page_texts)
 
@@ -42,18 +34,6 @@ def load_json_page(json_page):
     raise ValueError("json page는 file path, dict, list 중 하나여야 합니다.")
 
 
-def extract_deepseek_text(deepseek_payload):
-    if not isinstance(deepseek_payload, dict):
-        return ""
-
-    raw_text = str(deepseek_payload.get("text") or "")
-    raw_text = re.sub(r"<\|det\|>.*?<\|/det\|>", "\n", raw_text, flags=re.S)
-    raw_text = re.sub(r"<\|ref\|>.*?<\|/ref\|>", "\n", raw_text, flags=re.S)
-    raw_text = re.sub(r"</(td|th|tr|table)>", "\n", raw_text, flags=re.I)
-    raw_text = re.sub(r"<[^>]+>", " ", raw_text)
-    return clean_block_text(html.unescape(raw_text))
-
-
 def extract_paddle_text(paddle_payload):
     paddle_result = paddle_payload
     if isinstance(paddle_payload, list):
@@ -67,12 +47,8 @@ def extract_paddle_text(paddle_payload):
 
     rec_texts = paddle_result.get("rec_texts")
     if isinstance(rec_texts, list):
-        return clean_ocr_text_lines(rec_texts)
+        return clean_text_lines(rec_texts)
     return clean_block_text(paddle_result.get("text"))
-
-
-def build_ocr_page_text(deepseek_text, paddle_text):
-    return merge_raw_texts([deepseek_text, paddle_text])
 
 
 def normalize_axis_target(raw_axis_target):
@@ -139,7 +115,7 @@ def clean_text_list(values):
     return clean_values
 
 
-def clean_ocr_text_lines(values):
+def clean_text_lines(values):
     lines = []
     for value in values:
         clean_value = clean_text(value)

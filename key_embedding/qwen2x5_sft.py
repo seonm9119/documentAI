@@ -4,15 +4,17 @@ import os
 from pathlib import Path
 
 import torch
-from datasets import Dataset
+from datasets import Dataset, disable_progress_bar
 from peft import LoraConfig, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, EarlyStoppingCallback, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, EarlyStoppingCallback, TrainerCallback, TrainingArguments
 from trl import SFTTrainer
 
 try:
-    from .schema import normalize_target_payload, ocr_page_jsons_to_model_text
+    from . import config
+    from .schema import normalize_target_payload, paddle_page_jsons_to_model_text
 except ImportError:
-    from schema import normalize_target_payload, ocr_page_jsons_to_model_text
+    import config
+    from schema import normalize_target_payload, paddle_page_jsons_to_model_text
 
 
 SYSTEM_PROMPT = """You are the key-embedding-graph model.
@@ -29,10 +31,10 @@ Even when the document has multiple pages, return one final document-level JSON 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-data", required=True)
-    parser.add_argument("--output-dir", default="output/key-embedding-graph-qwen2x5-0_5b")
-    parser.add_argument("--base-model", default=os.environ.get("KEY_EMBEDDING_BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"))
-    parser.add_argument("--max-seq-length", default=12288, type=int)
-    parser.add_argument("--epochs", default=3, type=float)
+    parser.add_argument("--output-dir", default=config.OUTPUT_DIR)
+    parser.add_argument("--base-model", default=os.environ.get("KEY_EMBEDDING_BASE_MODEL", config.BASE_MODEL))
+    parser.add_argument("--max-seq-length", default=config.MAX_SEQ_LENGTH, type=int)
+    parser.add_argument("--epochs", default=100, type=float)
     parser.add_argument("--learning-rate", default=2e-4, type=float)
     parser.add_argument("--eval-ratio", default=0.05, type=float)
     parser.add_argument("--batch-size", default=1, type=int)
@@ -44,16 +46,19 @@ def parse_args():
     parser.add_argument("--save-steps", default=100, type=int)
     parser.add_argument("--logging-steps", default=10, type=int)
     parser.add_argument("--early-stopping-patience", default=5, type=int)
+    parser.add_argument("--early-stopping-threshold", default=3e-4, type=float)
     parser.add_argument("--eval-accumulation-steps", default=1, type=int)
     parser.add_argument("--device-map", default="auto")
     return parser.parse_args()
 
 
 def main():
+    disable_progress_bar()
     args = parse_args()
-    tokenizer, model = load_qwen_model_and_tokenizer(args)
+    tokenizer = load_qwen_tokenizer(args)
     full_dataset = load_sft_dataset(args.train_data, tokenizer)
     train_dataset, eval_dataset = split_train_eval_dataset(full_dataset, args.eval_ratio)
+    model = load_qwen_model(args)
 
     lora_config = build_lora_config(args)
     training_args = build_training_args(args, eval_dataset)
@@ -79,11 +84,20 @@ def main():
 
 
 def load_qwen_model_and_tokenizer(args):
+    tokenizer = load_qwen_tokenizer(args)
+    model = load_qwen_model(args)
+    return tokenizer, model
+
+
+def load_qwen_tokenizer(args):
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
+    return tokenizer
 
+
+def load_qwen_model(args):
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -100,7 +114,7 @@ def load_qwen_model_and_tokenizer(args):
     )
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model)
-    return tokenizer, model
+    return model
 
 
 def load_sft_dataset(train_data_path, tokenizer):
@@ -163,12 +177,11 @@ def get_target_payload(source_record, line_number):
 
 
 def build_model_input_text(source_record, line_number):
-    deepseek_pages = source_record.get("deepseek_pages")
     paddle_pages = source_record.get("paddle_pages")
-    if not isinstance(deepseek_pages, list) or not isinstance(paddle_pages, list):
-        raise ValueError(f"{line_number}번째 record에 deepseek_pages와 paddle_pages list가 필요합니다.")
+    if not isinstance(paddle_pages, list):
+        raise ValueError(f"{line_number}번째 record에 paddle_pages list가 필요합니다.")
 
-    return ocr_page_jsons_to_model_text(deepseek_pages, paddle_pages)
+    return paddle_page_jsons_to_model_text(paddle_pages)
 
 
 def build_user_prompt(model_input_text):
@@ -209,10 +222,33 @@ def compute_token_accuracy(eval_prediction):
     return {"token_accuracy": float(correct_count) / float(label_count)}
 
 
+class EpochProgressCallback(TrainerCallback):
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        current_epoch = int(state.epoch or 0) + 1
+        total_epochs = int(args.num_train_epochs)
+        print(f"[epoch {current_epoch}/{total_epochs}] train begin", flush=True)
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not metrics:
+            return
+
+        metric_parts = []
+        for metric_name in ["eval_loss", "eval_token_accuracy"]:
+            if metric_name in metrics:
+                metric_parts.append(f"{metric_name}={metrics[metric_name]:.6f}")
+        if metric_parts:
+            print(f"[epoch {state.epoch:.2f}] validation {' '.join(metric_parts)}", flush=True)
+
+
 def build_callbacks(args, eval_dataset):
+    callbacks = [EpochProgressCallback()]
     if eval_dataset is None or args.early_stopping_patience <= 0:
-        return []
-    return [EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)]
+        return callbacks
+    callbacks.append(EarlyStoppingCallback(
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_threshold=args.early_stopping_threshold,
+    ))
+    return callbacks
 
 
 def build_lora_config(args):
@@ -232,7 +268,8 @@ def build_lora_config(args):
 
 
 def build_training_args(args, eval_dataset):
-    evaluation_strategy = "steps" if eval_dataset is not None else "no"
+    evaluation_strategy = "epoch" if eval_dataset is not None else "no"
+    save_strategy = "epoch" if eval_dataset is not None else "steps"
     load_best_model = eval_dataset is not None
     return TrainingArguments(
         output_dir=args.output_dir,
@@ -243,12 +280,12 @@ def build_training_args(args, eval_dataset):
         learning_rate=args.learning_rate,
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
+        logging_strategy="epoch",
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        eval_steps=args.save_steps,
         save_total_limit=2,
         evaluation_strategy=evaluation_strategy,
-        save_strategy="steps",
+        save_strategy=save_strategy,
         load_best_model_at_end=load_best_model,
         metric_for_best_model="eval_loss" if load_best_model else None,
         greater_is_better=False if load_best_model else None,
@@ -258,6 +295,7 @@ def build_training_args(args, eval_dataset):
         gradient_checkpointing=True,
         eval_accumulation_steps=args.eval_accumulation_steps,
         remove_unused_columns=True,
+        disable_tqdm=True,
         report_to=[],
     )
 

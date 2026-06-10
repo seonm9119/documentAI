@@ -1,0 +1,10 @@
+MAX_SEQ_LENGTH = 12288
+RE_TRAIN_TOKEN_MARGIN = 1000
+BASE_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+OUTPUT_DIR = "output/key-embedding-graph-qwen2x5-1_5b"
+TRAIN_SOURCE_DATA_NAME = "train/train_000001.jsonl"
+FILTERED_TRAIN_DATA_NAME = "train.jsonl"
+VAL_DATA_NAME = "val.jsonl"
+RE_TRAIN_DATA_DIR = "re_train"
+VAL_RATIO = 0.05
+RANDOM_SEED = 17
