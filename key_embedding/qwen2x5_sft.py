@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from datasets import Dataset
 from peft import LoraConfig, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, EarlyStoppingCallback, TrainingArguments
 from trl import SFTTrainer
 
 try:
@@ -43,6 +43,8 @@ def parse_args():
     parser.add_argument("--target-modules", default="q_proj,v_proj")
     parser.add_argument("--save-steps", default=100, type=int)
     parser.add_argument("--logging-steps", default=10, type=int)
+    parser.add_argument("--early-stopping-patience", default=5, type=int)
+    parser.add_argument("--eval-accumulation-steps", default=1, type=int)
     parser.add_argument("--device-map", default="auto")
     return parser.parse_args()
 
@@ -66,6 +68,9 @@ def main():
         dataset_text_field="text",
         max_seq_length=args.max_seq_length,
         packing=False,
+        compute_metrics=compute_token_accuracy if eval_dataset is not None else None,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_dataset is not None else None,
+        callbacks=build_callbacks(args, eval_dataset),
     )
 
     trainer.train()
@@ -181,6 +186,35 @@ def split_train_eval_dataset(full_dataset, eval_ratio):
     return split_dataset["train"], split_dataset["test"]
 
 
+def preprocess_logits_for_metrics(logits, labels):
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    return torch.argmax(logits, dim=-1)
+
+
+def compute_token_accuracy(eval_prediction):
+    predictions, labels = eval_prediction
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+
+    shifted_predictions = predictions[:, :-1]
+    shifted_labels = labels[:, 1:]
+    label_mask = shifted_labels != -100
+    label_count = label_mask.sum()
+
+    if label_count == 0:
+        return {"token_accuracy": 0.0}
+
+    correct_count = (shifted_predictions[label_mask] == shifted_labels[label_mask]).sum()
+    return {"token_accuracy": float(correct_count) / float(label_count)}
+
+
+def build_callbacks(args, eval_dataset):
+    if eval_dataset is None or args.early_stopping_patience <= 0:
+        return []
+    return [EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)]
+
+
 def build_lora_config(args):
     target_modules = [
         target_module.strip()
@@ -199,6 +233,7 @@ def build_lora_config(args):
 
 def build_training_args(args, eval_dataset):
     evaluation_strategy = "steps" if eval_dataset is not None else "no"
+    load_best_model = eval_dataset is not None
     return TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -214,10 +249,14 @@ def build_training_args(args, eval_dataset):
         save_total_limit=2,
         evaluation_strategy=evaluation_strategy,
         save_strategy="steps",
+        load_best_model_at_end=load_best_model,
+        metric_for_best_model="eval_loss" if load_best_model else None,
+        greater_is_better=False if load_best_model else None,
         fp16=True,
         bf16=False,
         optim="paged_adamw_8bit",
         gradient_checkpointing=True,
+        eval_accumulation_steps=args.eval_accumulation_steps,
         remove_unused_columns=False,
         report_to=[],
     )
