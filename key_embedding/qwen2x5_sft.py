@@ -257,7 +257,7 @@ def build_training_args(args, eval_dataset):
         optim="paged_adamw_8bit",
         gradient_checkpointing=True,
         eval_accumulation_steps=args.eval_accumulation_steps,
-        remove_unused_columns=False,
+        remove_unused_columns=True,
         report_to=[],
     )
 
