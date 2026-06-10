@@ -3,3 +3,6 @@ build_train_val.jsonl.py
 build_train_val_jsonl.py
 *.jsonl
 축정의*
+.venv/
+__pycache__/
+.cache/
