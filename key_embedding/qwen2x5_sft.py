@@ -15,22 +15,23 @@ except ImportError:
     from schema import normalize_target_payload, ocr_page_jsons_to_model_text
 
 
-SYSTEM_PROMPT = """너는 OCR 결과에서 문서 전체 기준 4축 key/signal을 추출하는 key-embedding-graph 모델이다.
-출력은 반드시 JSON 객체 하나만 작성한다.
-축은 subject, document_type, business_domain, modifier 네 개를 모두 포함한다.
-각 축은 key와 signals를 가진다.
-key는 문서를 대표하는 짧고 안정적인 개념이다.
-signals는 입력 OCR 텍스트에 실제로 등장한 근거 표현만 사용한다.
-근거가 약하거나 판단이 어려운 축은 key를 "unknown"으로 두고 signals는 빈 배열로 둔다.
-문서가 여러 페이지여도 최종 결과는 문서 단위 JSON 하나다."""
+SYSTEM_PROMPT = """You are the key-embedding-graph model.
+Extract document-level key/signal values from OCR text.
+Return exactly one JSON object and no extra text.
+The JSON object must include four axes: subject, document_type, business_domain, and modifier.
+Each axis must contain a key and signals.
+The key must be a short, stable concept that represents the document.
+Signals must be evidence phrases that actually appear in the input OCR text.
+If evidence is weak or an axis cannot be determined, set key to "unknown" and signals to an empty array.
+Even when the document has multiple pages, return one final document-level JSON object."""
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-data", required=True)
-    parser.add_argument("--output-dir", default="output/key-embedding-graph-qwen2x5")
-    parser.add_argument("--base-model", default=os.environ.get("KEY_EMBEDDING_BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct"))
-    parser.add_argument("--max-seq-length", default=4096, type=int)
+    parser.add_argument("--output-dir", default="output/key-embedding-graph-qwen2x5-0_5b")
+    parser.add_argument("--base-model", default=os.environ.get("KEY_EMBEDDING_BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"))
+    parser.add_argument("--max-seq-length", default=12288, type=int)
     parser.add_argument("--epochs", default=3, type=float)
     parser.add_argument("--learning-rate", default=2e-4, type=float)
     parser.add_argument("--eval-ratio", default=0.05, type=float)
@@ -167,7 +168,7 @@ def build_model_input_text(source_record, line_number):
 
 def build_user_prompt(model_input_text):
     return (
-        "다음 OCR 결과를 보고 문서 전체 기준 4축 key/signal JSON 하나만 출력하세요.\n\n"
+        "Read the following OCR text and return one document-level four-axis key/signal JSON object.\n\n"
         f"{model_input_text}"
     )
 
