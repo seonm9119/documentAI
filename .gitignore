@@ -1,7 +1,8 @@
 docuaipim/
-build_train_val.jsonl.py
-build_train_val_jsonl.py
 *.jsonl
+key_embedding/train/
+key_embedding/re_train/
+key_embedding/re_train.py
 축정의*
 .venv/
 __pycache__/
