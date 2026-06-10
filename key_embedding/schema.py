@@ -7,35 +7,20 @@ from pathlib import Path
 AXES = ("subject", "document_type", "business_domain", "modifier")
 
 
-def ocr_page_jsons_to_model_text(deepseek_pages, paddle_pages, file_name="", source_type="pdf"):
-    document_payload = ocr_page_jsons_to_document_payload(deepseek_pages, paddle_pages, file_name, source_type)
-    return document_payload_to_text(document_payload)
-
-
-def ocr_page_jsons_to_document_payload(deepseek_pages, paddle_pages, file_name="", source_type="pdf"):
+def ocr_page_jsons_to_model_text(deepseek_pages, paddle_pages):
     deepseek_page_payloads = load_json_pages(deepseek_pages, "deepseek_pages")
     paddle_page_payloads = load_json_pages(paddle_pages, "paddle_pages")
 
     if len(deepseek_page_payloads) != len(paddle_page_payloads):
         raise ValueError("deepseek_pages와 paddle_pages의 page 수가 같아야 합니다.")
 
-    pages = []
-    for page_index, page_pair in enumerate(zip(deepseek_page_payloads, paddle_page_payloads), start=1):
-        deepseek_page_payload, paddle_page_payload = page_pair
+    page_texts = []
+    for deepseek_page_payload, paddle_page_payload in zip(deepseek_page_payloads, paddle_page_payloads):
         deepseek_text = extract_deepseek_text(deepseek_page_payload)
         paddle_text = extract_paddle_text(paddle_page_payload)
-        pages.append({
-            "page_index": page_index,
-            "page_name": f"page_{page_index}",
-            "raw_text": build_ocr_page_text(deepseek_text, paddle_text),
-            "tables": [],
-        })
+        page_texts.append(build_ocr_page_text(deepseek_text, paddle_text))
 
-    return normalize_document_payload({
-        "file_name": file_name,
-        "source_type": source_type,
-        "pages": pages,
-    })
+    return merge_raw_texts(page_texts)
 
 
 def load_json_pages(json_pages, argument_name):
@@ -87,67 +72,7 @@ def extract_paddle_text(paddle_payload):
 
 
 def build_ocr_page_text(deepseek_text, paddle_text):
-    lines = []
-    append_section(lines, "DEEPSEEK_OCR_TEXT", deepseek_text)
-    append_section(lines, "PADDLE_OCR_TEXT", paddle_text)
-    return "\n".join(lines).strip()
-
-
-def normalize_document_payload(payload):
-    payload = payload if isinstance(payload, dict) else {}
-    return {
-        "file_name": clean_text(payload.get("file_name")),
-        "source_type": clean_text(payload.get("source_type")),
-        "pages": normalize_pages(payload.get("pages")),
-    }
-
-
-def normalize_pages(raw_pages):
-    if not isinstance(raw_pages, list):
-        return []
-
-    pages = []
-    for page_index, raw_page in enumerate(raw_pages, start=1):
-        if not isinstance(raw_page, dict):
-            continue
-        pages.append({
-            "page_index": positive_int(raw_page.get("page_index")) or page_index,
-            "page_name": clean_text(raw_page.get("page_name")),
-            "raw_text": clean_block_text(raw_page.get("raw_text")),
-            "tables": normalize_tables(raw_page.get("tables")),
-        })
-    return pages
-
-
-def normalize_tables(raw_tables):
-    if not isinstance(raw_tables, list):
-        return []
-
-    tables = []
-    for raw_table in raw_tables:
-        if not isinstance(raw_table, dict):
-            continue
-        tables.append({
-            "columns": clean_text_list(raw_table.get("columns")),
-            "rows": normalize_rows(raw_table.get("rows")),
-            "raw_text": clean_block_text(raw_table.get("raw_text")),
-        })
-    return tables
-
-
-def normalize_rows(raw_rows):
-    if not isinstance(raw_rows, list):
-        return []
-
-    rows = []
-    for raw_row in raw_rows:
-        if isinstance(raw_row, list):
-            row = clean_text_list(raw_row)
-        else:
-            row = clean_text_list([raw_row])
-        if row:
-            rows.append(row)
-    return rows
+    return merge_raw_texts([deepseek_text, paddle_text])
 
 
 def normalize_axis_target(raw_axis_target):
@@ -170,38 +95,18 @@ def normalize_target_payload(raw_target):
     }
 
 
-def document_payload_to_text(payload):
-    document_payload = normalize_document_payload(payload)
+def merge_raw_texts(raw_texts):
     lines = []
+    seen_lines = set()
 
-    append_section(lines, "FILE_NAME", document_payload["file_name"])
-    append_section(lines, "SOURCE_TYPE", document_payload["source_type"])
-
-    for page in document_payload["pages"]:
-        append_section(lines, f"PAGE_{page['page_index']}_NAME", page["page_name"])
-        append_section(lines, f"PAGE_{page['page_index']}_RAW_TEXT", page["raw_text"])
-        append_tables(lines, page["page_index"], page["tables"])
+    for raw_text in raw_texts:
+        for line in clean_block_text(raw_text).splitlines():
+            if not line or line in seen_lines:
+                continue
+            lines.append(line)
+            seen_lines.add(line)
 
     return "\n".join(lines).strip()
-
-
-def append_tables(lines, page_index, tables):
-    for table_index, table in enumerate(tables, start=1):
-        table_prefix = f"PAGE_{page_index}_TABLE_{table_index}"
-        if table["columns"]:
-            append_section(lines, f"{table_prefix}_COLUMNS", " | ".join(table["columns"]))
-        if table["rows"]:
-            row_lines = [" | ".join(row) for row in table["rows"] if row]
-            append_section(lines, f"{table_prefix}_ROWS", "\n".join(row_lines))
-        append_section(lines, f"{table_prefix}_RAW_TEXT", table["raw_text"])
-
-
-def append_section(lines, section_name, section_text):
-    section_text = clean_block_text(section_text)
-    if not section_text:
-        return
-    lines.append(f"[{section_name}]")
-    lines.append(section_text)
 
 
 def clean_text(value):
@@ -241,11 +146,3 @@ def clean_ocr_text_lines(values):
         if clean_value:
             lines.append(clean_value)
     return "\n".join(lines).strip()
-
-
-def positive_int(value):
-    try:
-        parsed_value = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed_value if parsed_value > 0 else None

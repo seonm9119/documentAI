@@ -162,9 +162,7 @@ def build_model_input_text(source_record, line_number):
     if not isinstance(deepseek_pages, list) or not isinstance(paddle_pages, list):
         raise ValueError(f"{line_number}번째 record에 deepseek_pages와 paddle_pages list가 필요합니다.")
 
-    file_name = source_record.get("file_name") or source_record.get("document_name") or ""
-    source_type = source_record.get("source_type") or "pdf"
-    return ocr_page_jsons_to_model_text(deepseek_pages, paddle_pages, file_name, source_type)
+    return ocr_page_jsons_to_model_text(deepseek_pages, paddle_pages)
 
 
 def build_user_prompt(model_input_text):
