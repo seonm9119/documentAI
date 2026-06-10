@@ -38,7 +38,8 @@ python -m pip install \
     "safetensors==0.4.3" \
     "numpy==1.26.4" \
     "scikit-learn==1.4.2" \
-    "orjson==3.9.12"
+    "orjson==3.9.12" \
+    "rich==15.0.0"
 
 python - <<'PY'
 import os
