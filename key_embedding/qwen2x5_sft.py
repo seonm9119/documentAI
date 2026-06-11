@@ -1,12 +1,13 @@
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 
 import torch
 from datasets import Dataset, disable_progress_bar
-from peft import LoraConfig, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, EarlyStoppingCallback, TrainerCallback, TrainingArguments
+from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments
 from trl import SFTTrainer
 
 try:
@@ -34,7 +35,6 @@ def parse_args():
     parser.add_argument("--output-dir", default=config.OUTPUT_DIR)
     parser.add_argument("--base-model", default=os.environ.get("KEY_EMBEDDING_BASE_MODEL", config.BASE_MODEL))
     parser.add_argument("--max-seq-length", default=config.MAX_SEQ_LENGTH, type=int)
-    parser.add_argument("--epochs", default=100, type=float)
     parser.add_argument("--learning-rate", default=2e-4, type=float)
     parser.add_argument("--eval-ratio", default=0.05, type=float)
     parser.add_argument("--batch-size", default=1, type=int)
@@ -55,13 +55,14 @@ def parse_args():
 def main():
     disable_progress_bar()
     args = parse_args()
+    prepare_existing_best_adapter(args)
     tokenizer = load_qwen_tokenizer(args)
     full_dataset = load_sft_dataset(args.train_data, tokenizer)
     train_dataset, eval_dataset = split_train_eval_dataset(full_dataset, args.eval_ratio)
     model = load_qwen_model(args)
 
-    lora_config = build_lora_config(args)
-    training_args = build_training_args(args, eval_dataset)
+    lora_config = None if isinstance(model, PeftModel) else build_lora_config(args)
+    training_args = build_training_args(args)
 
     trainer = SFTTrainer(
         model=model,
@@ -75,12 +76,9 @@ def main():
         packing=False,
         compute_metrics=compute_token_accuracy if eval_dataset is not None else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_dataset is not None else None,
-        callbacks=build_callbacks(args, eval_dataset),
     )
 
-    trainer.train()
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    train_until_early_stop(trainer, tokenizer, args, eval_dataset)
 
 
 def load_qwen_model_and_tokenizer(args):
@@ -114,7 +112,50 @@ def load_qwen_model(args):
     )
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model)
+    adapter_path = resolve_existing_adapter_path(args)
+    if adapter_path is not None:
+        print(f"adapter load: {adapter_path}", flush=True)
+        model = PeftModel.from_pretrained(model, adapter_path, is_trainable=True)
     return model
+
+
+def prepare_existing_best_adapter(args):
+    output_dir = Path(args.output_dir)
+    best_adapter_dir = output_dir / "best"
+    if adapter_checkpoint_exists(best_adapter_dir):
+        return
+    if not adapter_checkpoint_exists(output_dir):
+        return
+
+    copy_adapter_checkpoint(output_dir, best_adapter_dir)
+    print(f"adapter migrate: {output_dir} -> {best_adapter_dir}", flush=True)
+
+
+def resolve_existing_adapter_path(args):
+    output_dir = Path(args.output_dir)
+    best_adapter_dir = output_dir / "best"
+    if adapter_checkpoint_exists(best_adapter_dir):
+        return best_adapter_dir
+    if adapter_checkpoint_exists(output_dir):
+        return output_dir
+    return None
+
+
+def adapter_checkpoint_exists(adapter_dir):
+    adapter_dir = Path(adapter_dir)
+    return (adapter_dir / "adapter_config.json").exists() and (adapter_dir / "adapter_model.safetensors").exists()
+
+
+def copy_adapter_checkpoint(source_dir, target_dir):
+    source_dir = Path(source_dir)
+    target_dir = Path(target_dir)
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    for source_path in source_dir.iterdir():
+        if source_path.is_file():
+            shutil.copy2(source_path, target_dir / source_path.name)
 
 
 def load_sft_dataset(train_data_path, tokenizer):
@@ -222,33 +263,71 @@ def compute_token_accuracy(eval_prediction):
     return {"token_accuracy": float(correct_count) / float(label_count)}
 
 
-class EpochProgressCallback(TrainerCallback):
-    def on_epoch_begin(self, args, state, control, **kwargs):
-        current_epoch = int(state.epoch or 0) + 1
-        total_epochs = int(args.num_train_epochs)
-        print(f"[epoch {current_epoch}/{total_epochs}] train begin", flush=True)
+def train_until_early_stop(trainer, tokenizer, args, eval_dataset):
+    if eval_dataset is None:
+        raise ValueError("early stop 학습에는 validation dataset이 필요합니다.")
 
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if not metrics:
+    best_eval_loss = None
+    stale_epoch_count = 0
+    epoch_number = 0
+
+    while True:
+        epoch_number += 1
+        print(f"[epoch {epoch_number}] train begin", flush=True)
+        trainer.train()
+
+        metrics = trainer.evaluate()
+        eval_loss = metrics.get("eval_loss")
+        if eval_loss is None:
+            raise ValueError("validation eval_loss를 계산하지 못했습니다.")
+
+        metric_parts = [f"eval_loss={eval_loss:.6f}"]
+        if "eval_token_accuracy" in metrics:
+            metric_parts.append(f"eval_token_accuracy={metrics['eval_token_accuracy']:.6f}")
+
+        if is_eval_loss_improved(best_eval_loss, eval_loss, args.early_stopping_threshold):
+            best_eval_loss = eval_loss
+            stale_epoch_count = 0
+            save_best_adapter(trainer, tokenizer, args)
+            metric_parts.append("best=true")
+        else:
+            stale_epoch_count += 1
+            metric_parts.append(f"best=false stale={stale_epoch_count}/{args.early_stopping_patience}")
+
+        print(f"[epoch {epoch_number}] validation {' '.join(metric_parts)}", flush=True)
+        if stale_epoch_count >= args.early_stopping_patience:
+            print(
+                f"early stop: best_eval_loss={best_eval_loss:.6f} "
+                f"threshold={args.early_stopping_threshold} "
+                f"patience={args.early_stopping_patience}",
+                flush=True,
+            )
             return
 
-        metric_parts = []
-        for metric_name in ["eval_loss", "eval_token_accuracy"]:
-            if metric_name in metrics:
-                metric_parts.append(f"{metric_name}={metrics[metric_name]:.6f}")
-        if metric_parts:
-            print(f"[epoch {state.epoch:.2f}] validation {' '.join(metric_parts)}", flush=True)
+
+def is_eval_loss_improved(best_eval_loss, eval_loss, early_stopping_threshold):
+    if best_eval_loss is None:
+        return True
+    return best_eval_loss - eval_loss >= early_stopping_threshold
 
 
-def build_callbacks(args, eval_dataset):
-    callbacks = [EpochProgressCallback()]
-    if eval_dataset is None or args.early_stopping_patience <= 0:
-        return callbacks
-    callbacks.append(EarlyStoppingCallback(
-        early_stopping_patience=args.early_stopping_patience,
-        early_stopping_threshold=args.early_stopping_threshold,
-    ))
-    return callbacks
+def save_best_adapter(trainer, tokenizer, args):
+    output_dir = Path(args.output_dir)
+    best_adapter_dir = output_dir / "best"
+    previous_best_adapter_dir = output_dir / "previous_best"
+    temporary_best_adapter_dir = output_dir / "best_tmp"
+
+    if temporary_best_adapter_dir.exists():
+        shutil.rmtree(temporary_best_adapter_dir)
+
+    trainer.save_model(str(temporary_best_adapter_dir))
+    tokenizer.save_pretrained(temporary_best_adapter_dir)
+
+    if previous_best_adapter_dir.exists():
+        shutil.rmtree(previous_best_adapter_dir)
+    if best_adapter_dir.exists():
+        shutil.move(str(best_adapter_dir), str(previous_best_adapter_dir))
+    shutil.move(str(temporary_best_adapter_dir), str(best_adapter_dir))
 
 
 def build_lora_config(args):
@@ -267,28 +346,23 @@ def build_lora_config(args):
     )
 
 
-def build_training_args(args, eval_dataset):
-    evaluation_strategy = "epoch" if eval_dataset is not None else "no"
-    save_strategy = "epoch" if eval_dataset is not None else "steps"
-    load_best_model = eval_dataset is not None
+def build_training_args(args):
     return TrainingArguments(
         output_dir=args.output_dir,
-        num_train_epochs=args.epochs,
+        num_train_epochs=1,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
-        logging_strategy="epoch",
+        logging_strategy="no",
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=2,
-        evaluation_strategy=evaluation_strategy,
-        save_strategy=save_strategy,
-        load_best_model_at_end=load_best_model,
-        metric_for_best_model="eval_loss" if load_best_model else None,
-        greater_is_better=False if load_best_model else None,
+        evaluation_strategy="no",
+        save_strategy="no",
+        load_best_model_at_end=False,
         fp16=True,
         bf16=False,
         optim="paged_adamw_8bit",
