@@ -7,3 +7,4 @@ key_embedding/re_train.py
 .venv/
 __pycache__/
 .cache/
+output/
