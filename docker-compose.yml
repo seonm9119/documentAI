@@ -1,0 +1,28 @@
+services:
+  document-ai:
+    build:
+      context: .
+    container_name: document-ai
+    restart: unless-stopped
+    ports:
+      - "8030:8030"
+    environment:
+      - DOCUMENT_AI_DATA_DIR=/app/data
+      - PADDLE_OCR_API_BASE_URL=http://paddle-ocr:8001
+      - KEY_EMBEDDING_API_BASE_URL=http://192.168.0.21:8004
+    volumes:
+      - ./data:/app/data
+      - ./api/classification/key_embedding/best:/app/api/classification/key_embedding/best:ro
+    networks:
+      - default
+      - awesome-net
+      - model-net
+
+networks:
+  default:
+  awesome-net:
+    external: true
+    name: awesome_default
+  model-net:
+    external: true
+    name: model-network

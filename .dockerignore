@@ -1,0 +1,13 @@
+.git
+.cache
+.venv
+__pycache__
+*.pyc
+
+data
+docuaipim
+output
+
+api/classification/key_embedding/__pycache__
+api/classification/key_embedding/train
+api/classification/key_embedding/re_train

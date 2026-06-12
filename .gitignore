@@ -8,3 +8,4 @@ key_embedding/re_train.py
 __pycache__/
 .cache/
 output/
+data/
