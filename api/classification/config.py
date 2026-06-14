@@ -144,7 +144,7 @@ PROJECTION_TRAIN_CONFIG = {
     "seed": 17,
     "batch_size": 64,
     "samples_per_key": 4,
-    "lr": 0.0002,
+    "lr": 0.0003,
     "early_stopping_patience": 5,
     "early_stopping_min_delta": 0.0005,
     "weight_decay": 0.01,

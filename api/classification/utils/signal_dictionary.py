@@ -170,13 +170,35 @@ def filter_colliding_signals(axis_samples):
 
 def split_axis_samples(axis_samples, valid_ratio, seed):
     rows = list(axis_samples)
-    random.Random(seed).shuffle(rows)
-    valid_count = int(round(len(rows) * float(valid_ratio)))
-    if valid_count <= 0 or valid_count >= len(rows):
+    ratio = float(valid_ratio)
+    if ratio <= 0 or len(rows) <= 1:
         return {"train": rows, "valid": []}
+
+    rng = random.Random(seed)
+    train_rows = []
+    valid_rows = []
+
+    for key, key_rows in sorted(rows_by_key(rows).items()):
+        key_rows = list(key_rows)
+        rng.shuffle(key_rows)
+
+        if len(key_rows) <= 1:
+            train_rows.extend(key_rows)
+            continue
+
+        valid_count = int(round(len(key_rows) * ratio))
+        valid_count = min(max(1, valid_count), len(key_rows) - 1)
+        valid_rows.extend(key_rows[:valid_count])
+        train_rows.extend(key_rows[valid_count:])
+
+    rng.shuffle(train_rows)
+    rng.shuffle(valid_rows)
+    if not valid_rows:
+        return {"train": rows, "valid": []}
+
     return {
-        "train": rows[valid_count:],
-        "valid": rows[:valid_count],
+        "train": train_rows,
+        "valid": valid_rows,
     }
 
 
