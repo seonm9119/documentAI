@@ -11,3 +11,5 @@ __pycache__/
 .cache/
 output/
 data/
+api/classification/model/train/train_qwen/
+api/classification/model/train/train_projection/

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 MODEL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-VENV_DIR="${KEY_EMBEDDING_VENV_DIR:-$SCRIPT_DIR/.venv}"
+VENV_DIR="${TRAIN_QWEN_VENV_DIR:-$SCRIPT_DIR/train_qwen}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
