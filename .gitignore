@@ -13,3 +13,4 @@ output/
 data/
 api/classification/model/train/train_qwen/
 api/classification/model/train/train_projection/
+api/classification/model/train/transport.sh
