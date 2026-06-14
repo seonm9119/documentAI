@@ -1,5 +1,7 @@
 docuaipim/
 *.jsonl
+*.pt
+api/classification/dictionary/
 key_embedding/train/
 key_embedding/re_train/
 key_embedding/re_train.py
