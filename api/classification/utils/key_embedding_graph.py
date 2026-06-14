@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -171,11 +172,19 @@ def normalize_dictionary(source_dictionary_dir, embedding_model, projection_mode
         if remove_norms_by_key:
             updated_file_count += 1
 
-        if remove_norms_by_key or output_path != source_path:
-            write_normalized_axis_records(output_path, source_records, axis_source, remove_norms_by_key)
+        dictionary_filter_stats = count_dictionary_filter_stats(source_records, axis_source)
+        write_stats = {
+            "dropped_empty_signal_key_count": 0,
+            "dropped_unsupported_language_signal_count": 0,
+            "dropped_key_matching_signal_count": 0,
+            "written_record_count": len(source_records),
+        }
+
+        if remove_norms_by_key or output_path != source_path or any(dictionary_filter_stats.values()):
+            write_stats = write_normalized_axis_records(output_path, source_records, axis_source, remove_norms_by_key)
             written_file_count += 1
 
-        axes_report[axis_name] = build_axis_normalize_report(source_path, output_path, axis_entries, remove_decisions)
+        axes_report[axis_name] = build_axis_normalize_report(source_path, output_path, axis_entries, remove_decisions, write_stats)
 
     summary = summarize_axes_normalize_report(axes_report)
     summary["updated_file_count"] = updated_file_count
@@ -222,29 +231,25 @@ def build_axis_entries_from_records(source_records, axis_name, axis_source):
             "axis": axis_name,
             "key": key,
             "record_index": record_index,
-            "signals": build_signal_entries(clean_raw_signals(source_record.get("signals"))),
+            "signals": build_signal_entries(clean_raw_signals(source_record.get("signals")), key),
         })
         seen_keys.add(key)
 
     return axis_entries
 
 
-def build_signal_entries(raw_signals):
+def build_signal_entries(raw_signals, key=None):
     signal_entries = []
-    seen_signals = set()
 
-    for signal_index, raw_signal in enumerate(raw_signals):
-        signal = normalize_display_text(raw_signal)
-        signal_norm = normalize_embedding_text(signal)
-        if not signal or signal_norm in seen_signals:
-            continue
+    cleaned_signals = clean_dictionary_signals(raw_signals)[0]
+    signals = remove_key_matching_signals(key, cleaned_signals)[0]
 
+    for signal_index, signal in enumerate(signals):
         signal_entries.append({
             "text": signal,
-            "text_norm": signal_norm,
+            "text_norm": normalize_embedding_text(signal),
             "signal_index": signal_index,
         })
-        seen_signals.add(signal_norm)
 
     return signal_entries
 
@@ -255,6 +260,69 @@ def clean_raw_signals(raw_signals):
     if isinstance(raw_signals, list):
         return raw_signals
     return []
+
+
+def clean_dictionary_signals(raw_signals):
+    signals = []
+    seen_signals = set()
+    dropped_unsupported_language_count = 0
+
+    for raw_signal in clean_raw_signals(raw_signals):
+        signal = normalize_display_text(raw_signal)
+        signal_key = normalize_embedding_text(signal)
+        if not signal or signal_key in seen_signals:
+            continue
+        if not is_allowed_dictionary_signal_text(signal):
+            dropped_unsupported_language_count += 1
+            continue
+
+        signals.append(signal)
+        seen_signals.add(signal_key)
+
+    return signals, dropped_unsupported_language_count
+
+
+def remove_key_matching_signals(key, signals):
+    key_text = normalize_display_text(key)
+    if not key_text:
+        return signals, 0
+
+    filtered_signals = []
+    dropped_key_matching_count = 0
+
+    for signal in signals:
+        if normalize_display_text(signal) == key_text:
+            dropped_key_matching_count += 1
+            continue
+
+        filtered_signals.append(signal)
+
+    return filtered_signals, dropped_key_matching_count
+
+
+def is_allowed_dictionary_signal_text(signal):
+    return all(is_allowed_dictionary_signal_char(character) for character in str(signal or ""))
+
+
+def is_allowed_dictionary_signal_char(character):
+    if character.isascii():
+        return True
+    if is_hangul_character(character):
+        return True
+
+    unicode_category = unicodedata.category(character)
+    return unicode_category[0] in {"N", "P", "S"} or unicode_category == "Zs"
+
+
+def is_hangul_character(character):
+    code_point = ord(character)
+    return (
+        0xAC00 <= code_point <= 0xD7A3
+        or 0x1100 <= code_point <= 0x11FF
+        or 0x3130 <= code_point <= 0x318F
+        or 0xA960 <= code_point <= 0xA97F
+        or 0xD7B0 <= code_point <= 0xD7FF
+    )
 
 
 def build_axis_vectors(embedding_model, projection_model, axis_name, axis_entries, args):
@@ -297,30 +365,80 @@ def group_remove_norms(remove_decisions):
     return remove_norms_by_key
 
 
-def write_normalized_axis_records(output_path, source_records, axis_source, remove_norms_by_key):
+def count_dictionary_filter_stats(source_records, axis_source):
     key_field = axis_source["key_field"]
+    stats = {
+        "empty_signal_key_count": 0,
+        "unsupported_language_signal_count": 0,
+        "key_matching_signal_count": 0,
+    }
 
     for source_record in source_records:
-        if not isinstance(source_record, dict) or "signals" not in source_record:
+        if not isinstance(source_record, dict):
             continue
 
         key = normalize_display_text(source_record.get(key_field))
-        remove_norms = remove_norms_by_key.get(key)
-        if not remove_norms:
+        signals, unsupported_language_count = clean_dictionary_signals(source_record.get("signals"))
+        signals, key_matching_count = remove_key_matching_signals(key, signals)
+        stats["unsupported_language_signal_count"] += unsupported_language_count
+        stats["key_matching_signal_count"] += key_matching_count
+        if key and not signals:
+            stats["empty_signal_key_count"] += 1
+
+    return stats
+
+
+def write_normalized_axis_records(output_path, source_records, axis_source, remove_norms_by_key):
+    key_field = axis_source["key_field"]
+    normalized_records = []
+    dropped_empty_signal_key_count = 0
+    dropped_unsupported_language_signal_count = 0
+    dropped_key_matching_signal_count = 0
+
+    for source_record in source_records:
+        if not isinstance(source_record, dict):
+            normalized_records.append(source_record)
             continue
 
-        source_record["signals"] = [
+        key = normalize_display_text(source_record.get(key_field))
+        remove_norms = remove_norms_by_key.get(key) or set()
+        cleaned_signals, unsupported_language_count = clean_dictionary_signals(source_record.get("signals"))
+        cleaned_signals, key_matching_count = remove_key_matching_signals(key, cleaned_signals)
+        dropped_unsupported_language_signal_count += unsupported_language_count
+        dropped_key_matching_signal_count += key_matching_count
+        signals = [
             signal
-            for signal in clean_raw_signals(source_record.get("signals"))
+            for signal in cleaned_signals
             if normalize_embedding_text(signal) not in remove_norms
         ]
 
+        if key and not signals:
+            dropped_empty_signal_key_count += 1
+            continue
+
+        normalized_record = dict(source_record)
+        normalized_record["signals"] = signals
+        normalized_records.append(normalized_record)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(source_records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    output_path.write_text(json.dumps(normalized_records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    return {
+        "dropped_empty_signal_key_count": dropped_empty_signal_key_count,
+        "dropped_unsupported_language_signal_count": dropped_unsupported_language_signal_count,
+        "dropped_key_matching_signal_count": dropped_key_matching_signal_count,
+        "written_record_count": len(normalized_records),
+    }
 
 
-def build_axis_normalize_report(source_path, output_path, axis_entries, remove_decisions):
+def build_axis_normalize_report(source_path, output_path, axis_entries, remove_decisions, write_stats=None):
+    write_stats = write_stats or {}
     signal_count = sum(len(axis_entry["signals"]) for axis_entry in axis_entries)
+    dropped_empty_signal_key_count = int(write_stats.get("dropped_empty_signal_key_count") or 0)
+    dropped_unsupported_language_signal_count = int(write_stats.get("dropped_unsupported_language_signal_count") or 0)
+    dropped_key_matching_signal_count = int(write_stats.get("dropped_key_matching_signal_count") or 0)
+    written_record_count_value = write_stats.get("written_record_count")
+    written_record_count = len(axis_entries) if written_record_count_value is None else int(written_record_count_value)
     removed_count_by_key = {}
 
     for remove_decision in remove_decisions:
@@ -332,10 +450,14 @@ def build_axis_normalize_report(source_path, output_path, axis_entries, remove_d
         "output_path": str(output_path),
         "summary": {
             "key_count": len(axis_entries),
+            "key_count_after": written_record_count,
             "signal_count_before": signal_count,
             "removed_signal_count": len(remove_decisions),
             "signal_count_after": signal_count - len(remove_decisions),
             "updated_key_count": len(removed_count_by_key),
+            "dropped_empty_signal_key_count": dropped_empty_signal_key_count,
+            "dropped_unsupported_language_signal_count": dropped_unsupported_language_signal_count,
+            "dropped_key_matching_signal_count": dropped_key_matching_signal_count,
         },
         "removed_signals": remove_decisions,
     }
@@ -344,10 +466,14 @@ def build_axis_normalize_report(source_path, output_path, axis_entries, remove_d
 def summarize_axes_normalize_report(axes_report):
     summary = {
         "key_count": 0,
+        "key_count_after": 0,
         "signal_count_before": 0,
         "removed_signal_count": 0,
         "signal_count_after": 0,
         "updated_key_count": 0,
+        "dropped_empty_signal_key_count": 0,
+        "dropped_unsupported_language_signal_count": 0,
+        "dropped_key_matching_signal_count": 0,
     }
 
     for axis_report in axes_report.values():
@@ -505,27 +631,16 @@ def load_axis_entries(dictionary_dir, axis_name, axis_source):
         axis_entries.append({
             "axis": axis_name,
             "key": canonical_key,
-            "signals": dedupe_signals(clean_raw_signals(source_record.get("signals"))),
+            "signals": dedupe_signals(clean_raw_signals(source_record.get("signals")), canonical_key),
         })
         seen_keys.add(canonical_key)
 
     return axis_entries
 
 
-def dedupe_signals(raw_signals):
-    signals = []
-    seen_signals = set()
-
-    for raw_signal in raw_signals:
-        signal = normalize_display_text(raw_signal)
-        signal_key = normalize_embedding_text(signal)
-        if not signal or signal_key in seen_signals:
-            continue
-
-        signals.append(signal)
-        seen_signals.add(signal_key)
-
-    return signals
+def dedupe_signals(raw_signals, key=None):
+    signals = clean_dictionary_signals(raw_signals)[0]
+    return remove_key_matching_signals(key, signals)[0]
 
 
 def build_axis_nodes(axis_name, axis_entries):
