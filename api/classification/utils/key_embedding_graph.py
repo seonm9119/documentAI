@@ -36,6 +36,7 @@ try:
         PROJECTION_ENCODER_TRUST_REMOTE_CODE,
         PROJECTION_MODEL_PATH,
         PROJECTION_PRECISION,
+        PROJECTION_TRAIN_DICTIONARY_DIR,
         SIGNAL_NORMALIZE_INSIDE_SCORE,
         SIGNAL_NORMALIZE_KEY_SCORE,
         SIGNAL_NORMALIZE_MARGIN,
@@ -71,6 +72,7 @@ except ImportError:
         PROJECTION_ENCODER_TRUST_REMOTE_CODE,
         PROJECTION_MODEL_PATH,
         PROJECTION_PRECISION,
+        PROJECTION_TRAIN_DICTIONARY_DIR,
         SIGNAL_NORMALIZE_INSIDE_SCORE,
         SIGNAL_NORMALIZE_KEY_SCORE,
         SIGNAL_NORMALIZE_MARGIN,
@@ -88,6 +90,7 @@ except ImportError:
 def parse_args():
     parser = argparse.ArgumentParser(description="Normalize dictionaries and build key embedding graph space.")
     parser.add_argument("--dictionary-dir", default=PROJECTION_DICTIONARY_DIR)
+    parser.add_argument("--source-dictionary-dir", default=PROJECTION_TRAIN_DICTIONARY_DIR)
     parser.add_argument("--output", default=KEY_EMBEDDING_GRAPH_OUTPUT_NAME)
     parser.add_argument("--report-output", default=KEY_EMBEDDING_NORMALIZE_REPORT_NAME)
     parser.add_argument("--model-name", default=PROJECTION_ENCODER_MODEL)
@@ -108,11 +111,19 @@ def parse_args():
 def main():
     args = parse_args()
     dictionary_dir = Path(args.dictionary_dir)
+    source_dictionary_dir = Path(args.source_dictionary_dir)
     graph_output_path = resolve_output_path(dictionary_dir, args.output)
     normalize_report_path = resolve_output_path(dictionary_dir, args.report_output)
     embedding_model = load_embedding_model(args.model_name, args.device, args.cache_folder, args.precision)
     projection_model, projection_metadata = load_trained_projection_model(PROJECTION_MODEL_PATH, args.device)
-    normalized_payload = normalize_dictionary(dictionary_dir, embedding_model, projection_model, projection_metadata, args)
+    normalized_payload = normalize_dictionary(
+        source_dictionary_dir,
+        embedding_model,
+        projection_model,
+        projection_metadata,
+        args,
+        output_dictionary_dir=dictionary_dir,
+    )
     graph_payload = build_key_embedding_space_payload(
         dictionary_dir,
         embedding_model,
@@ -138,13 +149,19 @@ def resolve_output_path(dictionary_dir, output):
     return dictionary_dir / output_path
 
 
-def normalize_dictionary(dictionary_dir, embedding_model, projection_model, projection_metadata, args):
+def normalize_dictionary(source_dictionary_dir, embedding_model, projection_model, projection_metadata, args, output_dictionary_dir=None):
+    source_dictionary_dir = Path(source_dictionary_dir)
+    output_dictionary_dir = Path(output_dictionary_dir or source_dictionary_dir)
+    output_dictionary_dir.mkdir(parents=True, exist_ok=True)
+
     axes_report = {}
     thresholds = build_signal_normalize_thresholds(args)
     updated_file_count = 0
+    written_file_count = 0
 
     for axis_name, axis_source in KEY_SIGNAL_AXIS_SOURCES.items():
-        source_path = dictionary_dir / axis_source["file_name"]
+        source_path = source_dictionary_dir / axis_source["file_name"]
+        output_path = output_dictionary_dir / axis_source["file_name"]
         source_records = json.loads(source_path.read_text(encoding="utf-8"))
         axis_entries = build_axis_entries_from_records(source_records, axis_name, axis_source)
         axis_vectors = build_axis_vectors(embedding_model, projection_model, axis_name, axis_entries, args)
@@ -152,19 +169,25 @@ def normalize_dictionary(dictionary_dir, embedding_model, projection_model, proj
         remove_norms_by_key = group_remove_norms(remove_decisions)
 
         if remove_norms_by_key:
-            write_normalized_axis_records(source_path, source_records, axis_source, remove_norms_by_key)
             updated_file_count += 1
 
-        axes_report[axis_name] = build_axis_normalize_report(source_path, axis_entries, remove_decisions)
+        if remove_norms_by_key or output_path != source_path:
+            write_normalized_axis_records(output_path, source_records, axis_source, remove_norms_by_key)
+            written_file_count += 1
+
+        axes_report[axis_name] = build_axis_normalize_report(source_path, output_path, axis_entries, remove_decisions)
 
     summary = summarize_axes_normalize_report(axes_report)
     summary["updated_file_count"] = updated_file_count
+    summary["written_file_count"] = written_file_count
 
     return {
         "model": "projection_signal_normalizer",
         "method": "remove_redundant_inside_key_area",
         "generated_at": current_utc_timestamp(),
-        "dictionary_dir": str(dictionary_dir),
+        "source_dictionary_dir": str(source_dictionary_dir),
+        "dictionary_dir": str(output_dictionary_dir),
+        "output_dictionary_dir": str(output_dictionary_dir),
         "projection_model_path": str(PROJECTION_MODEL_PATH),
         "projection_metadata": projection_metadata,
         "thresholds": thresholds,
@@ -274,7 +297,7 @@ def group_remove_norms(remove_decisions):
     return remove_norms_by_key
 
 
-def write_normalized_axis_records(source_path, source_records, axis_source, remove_norms_by_key):
+def write_normalized_axis_records(output_path, source_records, axis_source, remove_norms_by_key):
     key_field = axis_source["key_field"]
 
     for source_record in source_records:
@@ -292,10 +315,11 @@ def write_normalized_axis_records(source_path, source_records, axis_source, remo
             if normalize_embedding_text(signal) not in remove_norms
         ]
 
-    source_path.write_text(json.dumps(source_records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(source_records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def build_axis_normalize_report(source_path, axis_entries, remove_decisions):
+def build_axis_normalize_report(source_path, output_path, axis_entries, remove_decisions):
     signal_count = sum(len(axis_entry["signals"]) for axis_entry in axis_entries)
     removed_count_by_key = {}
 
@@ -304,6 +328,8 @@ def build_axis_normalize_report(source_path, axis_entries, remove_decisions):
 
     return {
         "source_file": source_path.name,
+        "source_path": str(source_path),
+        "output_path": str(output_path),
         "summary": {
             "key_count": len(axis_entries),
             "signal_count_before": signal_count,

@@ -10,11 +10,13 @@ from .config import (
     KEY_EMBEDDING_GRAPH_SPACE_SCALE,
     KEY_EMBEDDING_GRAPH_TOP_K,
     PROJECTION_BATCH_SIZE,
+    PROJECTION_CACHE_FOLDER,
     PROJECTION_DICTIONARY_DIR,
     PROJECTION_DEVICE,
     PROJECTION_ENCODER_MODEL,
     PROJECTION_MODEL_PATH,
     PROJECTION_PRECISION,
+    PROJECTION_TRAIN_DICTIONARY_DIR,
     QWEN_INFER_API_BASE_URL,
     QWEN_INFER_API_PATH,
     QWEN_INFER_MAX_NEW_TOKENS,
@@ -27,11 +29,12 @@ from .config import (
 )
 from .utils.key_embedding_graph import (
     build_key_embedding_space_payload,
+    load_embedding_model,
+    load_trained_projection_model,
     normalize_dictionary,
 )
 from .model.inference import (
     clear_projection_state,
-    load_projection_state,
     run_projection_inference,
 )
 
@@ -117,31 +120,40 @@ async def _call_qwen_infer_api(qwen_payload):
 
 
 def _normalize_redundant_inside_signals():
-    projection_state = load_projection_state()
-    graph_args = _key_embedding_graph_args()
+    graph_args, embedding_model, projection_model, projection_metadata = _load_projection_graph_assets()
     normalization_payload = normalize_dictionary(
-        PROJECTION_DICTIONARY_DIR,
-        projection_state["encoder"],
-        projection_state["projection_model"],
-        projection_state["checkpoint_metadata"],
+        PROJECTION_TRAIN_DICTIONARY_DIR,
+        embedding_model,
+        projection_model,
+        projection_metadata,
         graph_args,
+        output_dictionary_dir=PROJECTION_DICTIONARY_DIR,
     )
 
-    if normalization_payload["summary"].get("removed_signal_count"):
+    if normalization_payload["summary"].get("written_file_count"):
         clear_projection_state()
 
     return normalization_payload
 
 
 def _build_normalized_key_embedding_graph():
-    normalization_payload = _normalize_redundant_inside_signals()
-    projection_state = load_projection_state()
-    graph_args = _key_embedding_graph_args()
+    graph_args, embedding_model, projection_model, projection_metadata = _load_projection_graph_assets()
+    normalization_payload = normalize_dictionary(
+        PROJECTION_TRAIN_DICTIONARY_DIR,
+        embedding_model,
+        projection_model,
+        projection_metadata,
+        graph_args,
+        output_dictionary_dir=PROJECTION_DICTIONARY_DIR,
+    )
+    if normalization_payload["summary"].get("written_file_count"):
+        clear_projection_state()
+
     graph_payload = build_key_embedding_space_payload(
         PROJECTION_DICTIONARY_DIR,
-        projection_state["encoder"],
-        projection_state["projection_model"],
-        projection_state["checkpoint_metadata"],
+        embedding_model,
+        projection_model,
+        projection_metadata,
         graph_args,
         normalization_payload,
     )
@@ -149,6 +161,18 @@ def _build_normalized_key_embedding_graph():
     _update_graph_embedding_metadata(graph_payload)
     _write_key_embedding_graph(graph_payload)
     return graph_payload
+
+
+def _load_projection_graph_assets():
+    graph_args = _key_embedding_graph_args()
+    embedding_model = load_embedding_model(
+        PROJECTION_ENCODER_MODEL,
+        PROJECTION_DEVICE,
+        PROJECTION_CACHE_FOLDER,
+        PROJECTION_PRECISION,
+    )
+    projection_model, projection_metadata = load_trained_projection_model(PROJECTION_MODEL_PATH, PROJECTION_DEVICE)
+    return graph_args, embedding_model, projection_model, projection_metadata
 
 
 def _key_embedding_graph_args():
