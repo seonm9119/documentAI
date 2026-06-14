@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py convert_to_img.py normalize.py ./
+COPY app.py ./
 COPY api ./api
 
 RUN mkdir -p /app/data/uploads /app/data/images /app/data/overlays
