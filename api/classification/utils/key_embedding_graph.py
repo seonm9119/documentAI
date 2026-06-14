@@ -411,7 +411,12 @@ def build_key_embedding_space_payload(dictionary_dir, embedding_model, projectio
             "projection_model": projection_metadata.get("model") or "key_embedding_projection",
             "projection_model_path": str(PROJECTION_MODEL_PATH),
             "projection_best_valid_loss": projection_metadata.get("best_valid_loss"),
-            "projection_train_epochs": projection_metadata.get("train_config", {}).get("epochs"),
+            "projection_train_epochs": projection_metadata.get(
+                "completed_epochs",
+                projection_metadata.get("train_config", {}).get("epochs"),
+            ),
+            "projection_best_epoch": projection_metadata.get("best_epoch"),
+            "projection_stopped_early": projection_metadata.get("stopped_early"),
             "projected_dim": projection_metadata.get("model_config", {}).get("output_dim"),
             "device": args.device,
             "precision": args.precision,
