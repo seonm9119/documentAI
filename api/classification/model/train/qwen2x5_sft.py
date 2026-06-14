@@ -20,7 +20,8 @@ except ImportError:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train-data", required=True)
+    parser.add_argument("--train-data", default=str(config.QWEN_TRAIN_DATA_PATH))
+    parser.add_argument("--val-data", default=str(config.QWEN_VAL_DATA_PATH))
     parser.add_argument("--output-dir", default=config.QWEN_OUTPUT_DIR)
     parser.add_argument("--base-model", default=os.environ.get("KEY_EMBEDDING_BASE_MODEL", config.QWEN_BASE_MODEL))
     parser.add_argument("--max-seq-length", default=config.QWEN_MAX_SEQ_LENGTH, type=int)
@@ -58,8 +59,10 @@ def main():
     args = parse_args()
     prepare_existing_best_adapter(args)
     tokenizer = load_qwen_tokenizer(args)
-    full_dataset = load_sft_dataset(args.train_data, tokenizer)
-    train_dataset, eval_dataset = split_train_eval_dataset(full_dataset, args.eval_ratio)
+    train_dataset = load_sft_dataset(args.train_data, tokenizer)
+    eval_dataset = load_validation_dataset(args.val_data, tokenizer)
+    if eval_dataset is None:
+        train_dataset, eval_dataset = split_train_eval_dataset(train_dataset, args.eval_ratio)
     model = load_qwen_model(args)
 
     lora_config = None if isinstance(model, PeftModel) else build_lora_config(args)
@@ -179,8 +182,23 @@ def load_sft_dataset(train_data_path, tokenizer):
     return Dataset.from_list(train_records)
 
 
+def load_validation_dataset(val_data_path, tokenizer):
+    if not val_data_path:
+        return None
+
+    val_data_path = Path(val_data_path)
+    if not val_data_path.exists():
+        print(f"validation data not found, split train dataset instead: {val_data_path}", flush=True)
+        return None
+
+    return load_sft_dataset(val_data_path, tokenizer)
+
+
 def load_source_records(train_data_path):
     train_data_path = Path(train_data_path)
+    if not train_data_path.exists():
+        raise FileNotFoundError(f"학습 데이터 파일/폴더를 찾을 수 없습니다: {train_data_path}")
+
     if train_data_path.is_dir():
         source_records = []
         for record_path in sorted(train_data_path.glob("*.json")):

@@ -9,13 +9,13 @@ import torch
 
 from ...config import (
     KEY_SIGNAL_AXIS_SOURCES,
-    PROJECTION_DICTIONARY_DIR,
     PROJECTION_CACHE_FOLDER,
     PROJECTION_DEVICE,
     PROJECTION_ENCODER_MODEL,
     PROJECTION_MODEL_CONFIG,
     PROJECTION_MODEL_PATH,
     PROJECTION_PRECISION,
+    PROJECTION_TRAIN_DICTIONARY_DIR,
     PROJECTION_TRAIN_CONFIG,
 )
 from ...utils.signal_dictionary import (
@@ -36,7 +36,7 @@ from .network import KeyEmbeddingProjectionModel, save_projection_model
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train key-signal projection heads for dictionary quality gates.")
-    parser.add_argument("--dictionary-dir", default=str(PROJECTION_DICTIONARY_DIR))
+    parser.add_argument("--dictionary-dir", default=str(PROJECTION_TRAIN_DICTIONARY_DIR))
     parser.add_argument("--output", default=str(PROJECTION_MODEL_PATH))
     parser.add_argument("--encoder-model", default=PROJECTION_ENCODER_MODEL)
     parser.add_argument("--cache-folder", default=PROJECTION_CACHE_FOLDER)
