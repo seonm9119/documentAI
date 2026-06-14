@@ -9,10 +9,26 @@ services:
     environment:
       - DOCUMENT_AI_DATA_DIR=/app/data
       - PADDLE_OCR_API_BASE_URL=http://paddle-ocr:8001
-      - KEY_EMBEDDING_API_BASE_URL=http://192.168.0.21:8004
+      - QWEN_INFER_API_BASE_URL=http://192.168.0.21:8004
+      - PROJECTION_MODEL_PATH=/app/api/classification/model/train/key_projection_model.pt
+      - PROJECTION_DICTIONARY_DIR=/app/api/classification/dictionary
+      - PROJECTION_ENCODER_MODEL=nlpai-lab/KURE-v1
+      - PROJECTION_DEVICE=cuda
+      - PROJECTION_CACHE_FOLDER=/app/data/model-cache/sentence-transformers
+      - PROJECTION_PRECISION=fp16
+      - KEY_EMBEDDING_GRAPH_MODEL=nlpai-lab/KURE-v1
+      - KEY_EMBEDDING_GRAPH_DEVICE=cuda
+      - KEY_EMBEDDING_GRAPH_CACHE_DIR=/app/data/model-cache/sentence-transformers
+      - KEY_EMBEDDING_GRAPH_PRECISION=fp16
+      - KEY_EMBEDDING_GRAPH_PATH=/app/api/classification/dictionary/key_embedding_graph.json
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    gpus: all
     volumes:
       - ./data:/app/data
-      - ./api/classification/key_embedding/best:/app/api/classification/key_embedding/best:ro
+      - ./api/classification/dictionary:/app/api/classification/dictionary
+      - ./api/classification/model:/app/api/classification/model:ro
+      - ./api/classification/utils:/app/api/classification/utils:ro
     networks:
       - default
       - awesome-net

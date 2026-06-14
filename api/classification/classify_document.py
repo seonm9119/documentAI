@@ -1,193 +1,187 @@
-import base64
 import json
-import os
-import re
-import shutil
-from pathlib import Path
-from uuid import uuid4
+from types import SimpleNamespace
 
 import httpx
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, HTTPException, Request
 
-from convert_to_img import convert_uploaded_file_to_images
-from normalize import normalize_ocr_text
-from .key_embedding.overlay import build_signal_overlay_images
-from .key_embedding.schema import normalize_target_payload, paddle_page_jsons_to_model_text
-
-
-DATA_DIR = Path(os.environ.get("DOCUMENT_AI_DATA_DIR", "/app/data"))
-UPLOAD_DIR = DATA_DIR / "uploads"
-IMAGE_DIR = DATA_DIR / "images"
-PADDLE_DIR = DATA_DIR / "paddle"
-OVERLAY_DIR = DATA_DIR / "overlays"
-AXES = ("subject", "document_type", "business_domain", "modifier")
-PADDLE_OCR_API_BASE_URL = os.environ.get("PADDLE_OCR_API_BASE_URL", "http://paddle-ocr:8001")
-PADDLE_OCR_API_PATH = os.environ.get("PADDLE_OCR_API_PATH", "/inference")
-PADDLE_OCR_TIMEOUT_SECONDS = float(os.environ.get("PADDLE_OCR_TIMEOUT_SECONDS", "300"))
-KEY_EMBEDDING_API_BASE_URL = os.environ.get("KEY_EMBEDDING_API_BASE_URL", "http://192.168.0.21:8004")
-KEY_EMBEDDING_API_PATH = os.environ.get("KEY_EMBEDDING_API_PATH", "/infer")
-KEY_EMBEDDING_TIMEOUT_SECONDS = float(os.environ.get("KEY_EMBEDDING_TIMEOUT_SECONDS", "300"))
-KEY_EMBEDDING_MAX_NEW_TOKENS = int(os.environ.get("KEY_EMBEDDING_MAX_NEW_TOKENS", "512"))
-KEY_EMBEDDING_TEMPERATURE = float(os.environ.get("KEY_EMBEDDING_TEMPERATURE", "0"))
+from .config import (
+    KEY_EMBEDDING_GRAPH_MIN_SIMILARITY,
+    KEY_EMBEDDING_GRAPH_PATH,
+    KEY_EMBEDDING_GRAPH_SPACE_SCALE,
+    KEY_EMBEDDING_GRAPH_TOP_K,
+    PROJECTION_BATCH_SIZE,
+    PROJECTION_DICTIONARY_DIR,
+    PROJECTION_DEVICE,
+    PROJECTION_ENCODER_MODEL,
+    PROJECTION_MODEL_PATH,
+    PROJECTION_PRECISION,
+    QWEN_INFER_API_BASE_URL,
+    QWEN_INFER_API_PATH,
+    QWEN_INFER_MAX_NEW_TOKENS,
+    QWEN_INFER_TEMPERATURE,
+    QWEN_INFER_TIMEOUT_SECONDS,
+    SIGNAL_NORMALIZE_INSIDE_SCORE,
+    SIGNAL_NORMALIZE_KEY_SCORE,
+    SIGNAL_NORMALIZE_MARGIN,
+    SIGNAL_NORMALIZE_MAX_OTHER_SCORE,
+)
+from .utils.key_embedding_graph import (
+    build_key_embedding_space_payload,
+    normalize_dictionary,
+)
+from .model.inference import (
+    clear_projection_state,
+    load_projection_state,
+    run_projection_inference,
+)
 
 
 router = APIRouter()
 
 
-@router.post("/classify-document")
-async def classify_document(file: UploadFile = File(...)):
-    job_id = uuid4().hex[:12]
-    upload_name = _safe_file_name(file.filename)
-    source_path = UPLOAD_DIR / job_id / upload_name
-    output_dir = IMAGE_DIR / job_id
-    paddle_output_dir = PADDLE_DIR / job_id
-    overlay_output_dir = OVERLAY_DIR / job_id
+@router.post("/qwen-infer")
+async def qwen_infer(request: Request):
+    request_payload = await _load_json_request(request)
+    qwen_payload = _build_qwen_infer_payload(request_payload)
+    return await _call_qwen_infer_api(qwen_payload)
 
+
+@router.post("/projection-infer")
+async def projection_infer(request: Request):
+    request_payload = await _load_json_request(request)
     try:
-        _save_upload_file(file, source_path)
-        image_paths = convert_uploaded_file_to_images(source_path, output_dir)
-        paddle_pages = await _extract_paddle_pages(image_paths)
-        paddle_page_paths = _save_paddle_pages(paddle_pages, paddle_output_dir)
-        normalized_text = _normalize_paddle_pages(paddle_pages)
-        inference_response = await _infer_key_embedding(normalized_text) if normalized_text else None
-        classification_result = _normalize_key_embedding_response(inference_response)
-        overlay_images = build_signal_overlay_images(
-            image_paths,
-            paddle_pages,
-            classification_result,
-            overlay_output_dir,
-        )
+        return run_projection_inference(request_payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    finally:
-        await file.close()
-
-    return {
-        "job_id": job_id,
-        "file_name": upload_name,
-        "page_count": len(image_paths),
-        "images": [_relative_data_path(path) for path in image_paths],
-        "paddle_pages": [_relative_data_path(path) for path in paddle_page_paths],
-        "overlay_images": [_overlay_image_payload(overlay_image) for overlay_image in overlay_images],
-        "ocr_text": normalized_text,
-        "result": classification_result,
-        "raw_output": _raw_output_from_response(inference_response),
-        "warnings": _warnings_from_response(inference_response),
-        "status": "classified" if inference_response else "no_ocr_text",
-    }
 
 
-def _save_upload_file(file, source_path):
-    source_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(source_path, "wb") as output_file:
-        shutil.copyfileobj(file.file, output_file)
-
-
-def _empty_axis_result():
-    return {
-        axis: {
-            "key": "unknown",
-            "signals": [],
-        }
-        for axis in AXES
-    }
-
-
-async def _extract_paddle_pages(image_paths):
-    paddle_pages = []
-    for image_path in image_paths:
-        paddle_pages.append(await _call_paddle_ocr(image_path))
-    return paddle_pages
-
-
-async def _call_paddle_ocr(image_path):
-    payload = {
-        "byte_img": base64.b64encode(Path(image_path).read_bytes()).decode("ascii"),
-        "release_after_inference": True,
-        "predict_options": {
-            "use_doc_orientation_classify": False,
-            "use_doc_unwarping": False,
-            "use_textline_orientation": False,
-            "return_word_box": False,
-        },
-    }
-    url = _service_url(PADDLE_OCR_API_BASE_URL, PADDLE_OCR_API_PATH)
-
+@router.post("/projection-normalize-signals")
+async def projection_normalize_signals():
     try:
-        async with httpx.AsyncClient(timeout=PADDLE_OCR_TIMEOUT_SECONDS) as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPStatusError as exc:
-        detail = _response_error_detail(exc.response)
-        raise HTTPException(status_code=502, detail=f"Paddle OCR API failed: {detail}") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Paddle OCR API unreachable: {exc}") from exc
+        return _normalize_redundant_inside_signals()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def _save_paddle_pages(paddle_pages, output_dir):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_paths = []
-
-    for page_index, paddle_page in enumerate(paddle_pages, start=1):
-        output_path = output_dir / f"page_{page_index:03d}.json"
-        with open(output_path, "w", encoding="utf-8") as output_file:
-            json.dump(paddle_page, output_file, ensure_ascii=False, indent=2)
-        output_paths.append(output_path)
-
-    return output_paths
+@router.post("/key-embedding-graph")
+async def build_key_embedding_graph():
+    try:
+        return _build_normalized_key_embedding_graph()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def _normalize_paddle_pages(paddle_pages):
-    raw_text = paddle_page_jsons_to_model_text(paddle_pages)
-    return normalize_ocr_text(raw_text)
+async def _load_json_request(request):
+    try:
+        request_payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="json body가 필요합니다.") from exc
+
+    if not isinstance(request_payload, dict):
+        raise HTTPException(status_code=400, detail="json body는 객체여야 합니다.")
+    return request_payload
 
 
-async def _infer_key_embedding(text):
-    payload = {
+def _build_qwen_infer_payload(request_payload):
+    text = _clean_text(request_payload.get("text"))
+    if not text:
+        raise HTTPException(status_code=400, detail="text가 필요합니다.")
+
+    return {
         "text": text,
-        "max_new_tokens": KEY_EMBEDDING_MAX_NEW_TOKENS,
-        "temperature": KEY_EMBEDDING_TEMPERATURE,
-        "include_raw": False,
+        "max_new_tokens": _positive_int(request_payload.get("max_new_tokens"), QWEN_INFER_MAX_NEW_TOKENS),
+        "temperature": _float_value(request_payload.get("temperature"), QWEN_INFER_TEMPERATURE),
+        "include_raw": bool(request_payload.get("include_raw", False)),
     }
-    url = _service_url(KEY_EMBEDDING_API_BASE_URL, KEY_EMBEDDING_API_PATH)
+
+
+async def _call_qwen_infer_api(qwen_payload):
+    url = _service_url(QWEN_INFER_API_BASE_URL, QWEN_INFER_API_PATH)
 
     try:
-        async with httpx.AsyncClient(timeout=KEY_EMBEDDING_TIMEOUT_SECONDS) as client:
-            response = await client.post(url, json=payload)
+        async with httpx.AsyncClient(timeout=QWEN_INFER_TIMEOUT_SECONDS) as client:
+            response = await client.post(url, json=qwen_payload)
             response.raise_for_status()
             return response.json()
     except httpx.HTTPStatusError as exc:
         detail = _response_error_detail(exc.response)
-        raise HTTPException(status_code=502, detail=f"Key embedding API failed: {detail}") from exc
+        raise HTTPException(status_code=502, detail=f"Qwen infer API failed: {detail}") from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Key embedding API unreachable: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Qwen infer API unreachable: {exc}") from exc
 
 
-def _normalize_key_embedding_response(inference_response):
-    if not isinstance(inference_response, dict):
-        return _empty_axis_result()
+def _normalize_redundant_inside_signals():
+    projection_state = load_projection_state()
+    graph_args = _key_embedding_graph_args()
+    normalization_payload = normalize_dictionary(
+        PROJECTION_DICTIONARY_DIR,
+        projection_state["encoder"],
+        projection_state["projection_model"],
+        projection_state["checkpoint_metadata"],
+        graph_args,
+    )
 
-    result_payload = inference_response.get("result")
-    if not isinstance(result_payload, dict):
-        result_payload = inference_response
+    if normalization_payload["summary"].get("removed_signal_count"):
+        clear_projection_state()
 
-    return normalize_target_payload(result_payload)
-
-
-def _raw_output_from_response(inference_response):
-    if isinstance(inference_response, dict):
-        return inference_response.get("raw_output")
-    return None
+    return normalization_payload
 
 
-def _warnings_from_response(inference_response):
-    warnings = inference_response.get("warnings") if isinstance(inference_response, dict) else []
-    if not isinstance(warnings, list):
-        return []
-    return [str(warning) for warning in warnings if str(warning).strip()]
+def _build_normalized_key_embedding_graph():
+    normalization_payload = _normalize_redundant_inside_signals()
+    projection_state = load_projection_state()
+    graph_args = _key_embedding_graph_args()
+    graph_payload = build_key_embedding_space_payload(
+        PROJECTION_DICTIONARY_DIR,
+        projection_state["encoder"],
+        projection_state["projection_model"],
+        projection_state["checkpoint_metadata"],
+        graph_args,
+        normalization_payload,
+    )
+
+    _update_graph_embedding_metadata(graph_payload)
+    _write_key_embedding_graph(graph_payload)
+    return graph_payload
+
+
+def _key_embedding_graph_args():
+    return SimpleNamespace(
+        model_name=PROJECTION_ENCODER_MODEL,
+        device=PROJECTION_DEVICE,
+        precision=PROJECTION_PRECISION,
+        batch_size=PROJECTION_BATCH_SIZE,
+        top_k=KEY_EMBEDDING_GRAPH_TOP_K,
+        min_similarity=KEY_EMBEDDING_GRAPH_MIN_SIMILARITY,
+        space_scale=KEY_EMBEDDING_GRAPH_SPACE_SCALE,
+        inside_score=SIGNAL_NORMALIZE_INSIDE_SCORE,
+        key_score=SIGNAL_NORMALIZE_KEY_SCORE,
+        margin=SIGNAL_NORMALIZE_MARGIN,
+        max_other_score=SIGNAL_NORMALIZE_MAX_OTHER_SCORE,
+    )
+
+
+def _update_graph_embedding_metadata(graph_payload):
+    embedding_payload = graph_payload.get("embedding")
+    if not isinstance(embedding_payload, dict):
+        return
+
+    embedding_payload["input_model"] = PROJECTION_ENCODER_MODEL
+    embedding_payload["projection_model_path"] = str(PROJECTION_MODEL_PATH)
+    embedding_payload["device"] = PROJECTION_DEVICE
+    embedding_payload["precision"] = PROJECTION_PRECISION
+    embedding_payload["batch_size"] = PROJECTION_BATCH_SIZE
+
+
+def _write_key_embedding_graph(graph_payload):
+    graph_source = json.dumps(graph_payload, ensure_ascii=False, indent=2)
+    KEY_EMBEDDING_GRAPH_PATH.write_text(graph_source + "\n", encoding="utf-8")
 
 
 def _service_url(base_url, path):
@@ -205,29 +199,26 @@ def _response_error_detail(response):
     return error_payload
 
 
-def _relative_data_path(path):
+def _positive_int(value, default_value):
+    if value is None:
+        return int(default_value)
     try:
-        return str(Path(path).relative_to(DATA_DIR))
-    except ValueError:
-        return str(path)
+        parsed_value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="max_new_tokens는 정수여야 합니다.") from exc
+    if parsed_value <= 0:
+        raise HTTPException(status_code=400, detail="max_new_tokens는 1 이상이어야 합니다.")
+    return parsed_value
 
 
-def _data_url(path):
-    return f"/document-ai-data/{_relative_data_path(path)}"
+def _float_value(value, default_value):
+    if value is None:
+        return float(default_value)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="temperature는 숫자여야 합니다.") from exc
 
 
-def _overlay_image_payload(overlay_image):
-    path = overlay_image["path"]
-    return {
-        "image": _relative_data_path(path),
-        "url": _data_url(path),
-        "matches": overlay_image.get("matches") or [],
-    }
-
-
-def _safe_file_name(file_name):
-    file_name = Path(str(file_name or "uploaded")).name
-    stem = Path(file_name).stem.strip()
-    suffix = Path(file_name).suffix.lower()
-    stem = re.sub(r"[^0-9A-Za-z_.-]+", "_", stem).strip("._-")
-    return f"{stem or 'uploaded'}{suffix}"
+def _clean_text(value):
+    return " ".join(str(value or "").replace("\r", "\n").split()).strip()

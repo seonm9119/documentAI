@@ -11,44 +11,45 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTTrainer
 
 try:
-    from . import config
-    from .schema import normalize_target_payload, paddle_page_jsons_to_model_text
+    from ... import config
+    from ...utils.signal_dictionary import clean_text, clean_text_list
 except ImportError:
-    import config
-    from schema import normalize_target_payload, paddle_page_jsons_to_model_text
-
-
-SYSTEM_PROMPT = """You are the key-embedding-graph model.
-Extract document-level key/signal values from OCR text.
-Return exactly one JSON object and no extra text.
-The JSON object must include four axes: subject, document_type, business_domain, and modifier.
-Each axis must contain a key and signals.
-The key must be a short, stable concept that represents the document.
-Signals must be evidence phrases that actually appear in the input OCR text.
-If evidence is weak or an axis cannot be determined, set key to "unknown" and signals to an empty array.
-Even when the document has multiple pages, return one final document-level JSON object."""
+    from api.classification import config
+    from api.classification.utils.signal_dictionary import clean_text, clean_text_list
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-data", required=True)
-    parser.add_argument("--output-dir", default=config.OUTPUT_DIR)
-    parser.add_argument("--base-model", default=os.environ.get("KEY_EMBEDDING_BASE_MODEL", config.BASE_MODEL))
-    parser.add_argument("--max-seq-length", default=config.MAX_SEQ_LENGTH, type=int)
-    parser.add_argument("--learning-rate", default=2e-4, type=float)
-    parser.add_argument("--eval-ratio", default=0.05, type=float)
-    parser.add_argument("--batch-size", default=1, type=int)
-    parser.add_argument("--grad-accum", default=16, type=int)
-    parser.add_argument("--lora-r", default=8, type=int)
-    parser.add_argument("--lora-alpha", default=16, type=int)
-    parser.add_argument("--lora-dropout", default=0.05, type=float)
-    parser.add_argument("--target-modules", default="q_proj,v_proj")
-    parser.add_argument("--save-steps", default=100, type=int)
-    parser.add_argument("--logging-steps", default=10, type=int)
-    parser.add_argument("--early-stopping-patience", default=5, type=int)
-    parser.add_argument("--early-stopping-threshold", default=3e-4, type=float)
-    parser.add_argument("--eval-accumulation-steps", default=1, type=int)
-    parser.add_argument("--device-map", default="auto")
+    parser.add_argument("--output-dir", default=config.QWEN_OUTPUT_DIR)
+    parser.add_argument("--base-model", default=os.environ.get("KEY_EMBEDDING_BASE_MODEL", config.QWEN_BASE_MODEL))
+    parser.add_argument("--max-seq-length", default=config.QWEN_MAX_SEQ_LENGTH, type=int)
+    parser.add_argument("--learning-rate", default=config.QWEN_SFT_TRAIN_CONFIG["learning_rate"], type=float)
+    parser.add_argument("--eval-ratio", default=config.QWEN_VAL_RATIO, type=float)
+    parser.add_argument("--batch-size", default=config.QWEN_SFT_TRAIN_CONFIG["batch_size"], type=int)
+    parser.add_argument("--grad-accum", default=config.QWEN_SFT_TRAIN_CONFIG["grad_accum"], type=int)
+    parser.add_argument("--lora-r", default=config.QWEN_LORA_CONFIG["r"], type=int)
+    parser.add_argument("--lora-alpha", default=config.QWEN_LORA_CONFIG["alpha"], type=int)
+    parser.add_argument("--lora-dropout", default=config.QWEN_LORA_CONFIG["dropout"], type=float)
+    parser.add_argument("--target-modules", default=config.QWEN_LORA_CONFIG["target_modules"])
+    parser.add_argument("--save-steps", default=config.QWEN_SFT_TRAIN_CONFIG["save_steps"], type=int)
+    parser.add_argument("--logging-steps", default=config.QWEN_SFT_TRAIN_CONFIG["logging_steps"], type=int)
+    parser.add_argument(
+        "--early-stopping-patience",
+        default=config.QWEN_SFT_TRAIN_CONFIG["early_stopping_patience"],
+        type=int,
+    )
+    parser.add_argument(
+        "--early-stopping-threshold",
+        default=config.QWEN_SFT_TRAIN_CONFIG["early_stopping_threshold"],
+        type=float,
+    )
+    parser.add_argument(
+        "--eval-accumulation-steps",
+        default=config.QWEN_SFT_TRAIN_CONFIG["eval_accumulation_steps"],
+        type=int,
+    )
+    parser.add_argument("--device-map", default=config.QWEN_SFT_TRAIN_CONFIG["device_map"])
     return parser.parse_args()
 
 
@@ -88,35 +89,42 @@ def load_qwen_model_and_tokenizer(args):
 
 
 def load_qwen_tokenizer(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=False)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model,
+        trust_remote_code=config.QWEN_TOKENIZER_CONFIG["trust_remote_code"],
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+    tokenizer.padding_side = config.QWEN_TOKENIZER_CONFIG["padding_side"]
     return tokenizer
 
 
 def load_qwen_model(args):
     quant_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
+        load_in_4bit=config.QWEN_QUANT_CONFIG["load_in_4bit"],
+        bnb_4bit_quant_type=config.QWEN_QUANT_CONFIG["bnb_4bit_quant_type"],
+        bnb_4bit_compute_dtype=get_torch_dtype(config.QWEN_QUANT_CONFIG["bnb_4bit_compute_dtype"]),
+        bnb_4bit_use_double_quant=config.QWEN_QUANT_CONFIG["bnb_4bit_use_double_quant"],
     )
 
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         quantization_config=quant_config,
         device_map=args.device_map,
-        trust_remote_code=False,
-        torch_dtype=torch.float16,
+        trust_remote_code=config.QWEN_MODEL_LOAD_CONFIG["trust_remote_code"],
+        torch_dtype=get_torch_dtype(config.QWEN_MODEL_LOAD_CONFIG["torch_dtype"]),
     )
-    model.config.use_cache = False
+    model.config.use_cache = config.QWEN_MODEL_LOAD_CONFIG["use_cache"]
     model = prepare_model_for_kbit_training(model)
     adapter_path = resolve_existing_adapter_path(args)
     if adapter_path is not None:
         print(f"adapter load: {adapter_path}", flush=True)
         model = PeftModel.from_pretrained(model, adapter_path, is_trainable=True)
     return model
+
+
+def get_torch_dtype(dtype_name):
+    return getattr(torch, str(dtype_name))
 
 
 def prepare_existing_best_adapter(args):
@@ -198,12 +206,107 @@ def load_source_records(train_data_path):
     return source_records
 
 
+def paddle_page_jsons_to_model_text(paddle_pages):
+    paddle_page_payloads = load_json_pages(paddle_pages, "paddle_pages")
+    page_texts = []
+    for paddle_page_payload in paddle_page_payloads:
+        page_texts.append(extract_paddle_text(paddle_page_payload))
+    return merge_raw_texts(page_texts)
+
+
+def load_json_pages(json_pages, argument_name):
+    if not isinstance(json_pages, list):
+        raise ValueError(f"{argument_name}는 json page list여야 합니다.")
+
+    page_payloads = []
+    for json_page in json_pages:
+        page_payloads.append(load_json_page(json_page))
+    return page_payloads
+
+
+def load_json_page(json_page):
+    if isinstance(json_page, (str, Path)):
+        return json.loads(Path(json_page).read_text(encoding="utf-8"))
+    if isinstance(json_page, (dict, list)):
+        return json_page
+    raise ValueError("json page는 file path, dict, list 중 하나여야 합니다.")
+
+
+def extract_paddle_text(paddle_payload):
+    paddle_result = paddle_payload
+    if isinstance(paddle_payload, list):
+        paddle_result = paddle_payload[0] if paddle_payload else {}
+    if not isinstance(paddle_result, dict):
+        return ""
+
+    paddle_result = paddle_result.get("res", paddle_result)
+    if not isinstance(paddle_result, dict):
+        return ""
+
+    rec_texts = paddle_result.get("rec_texts")
+    if isinstance(rec_texts, list):
+        return clean_text_lines(rec_texts)
+    return clean_block_text(paddle_result.get("text"))
+
+
+def normalize_target_payload(raw_target):
+    raw_target = raw_target if isinstance(raw_target, dict) else {}
+    return {
+        axis: normalize_axis_target(raw_target.get(axis))
+        for axis in config.KEY_SIGNAL_AXES
+    }
+
+
+def normalize_axis_target(raw_axis_target):
+    raw_axis_target = raw_axis_target if isinstance(raw_axis_target, dict) else {}
+    axis_key = clean_text(raw_axis_target.get("key")) or config.KEY_SIGNAL_UNKNOWN_KEY
+    signals = clean_text_list(raw_axis_target.get("signals"))
+    if axis_key == config.KEY_SIGNAL_UNKNOWN_KEY:
+        signals = []
+    return {
+        "key": axis_key,
+        "signals": signals,
+    }
+
+
+def merge_raw_texts(raw_texts):
+    lines = []
+    seen_lines = set()
+
+    for raw_text in raw_texts:
+        for line in clean_block_text(raw_text).splitlines():
+            if not line or line in seen_lines:
+                continue
+            lines.append(line)
+            seen_lines.add(line)
+
+    return "\n".join(lines).strip()
+
+
+def clean_block_text(value):
+    lines = []
+    for line in str(value or "").replace("\r", "\n").split("\n"):
+        clean_line = " ".join(line.split()).strip()
+        if clean_line:
+            lines.append(clean_line)
+    return "\n".join(lines).strip()
+
+
+def clean_text_lines(values):
+    lines = []
+    for value in values:
+        clean_value = clean_text(value)
+        if clean_value:
+            lines.append(clean_value)
+    return "\n".join(lines).strip()
+
+
 def build_sft_text(source_record, tokenizer, line_number):
     target_payload = get_target_payload(source_record, line_number)
     model_input_text = build_model_input_text(source_record, line_number)
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": config.QWEN_SYSTEM_PROMPT},
         {"role": "user", "content": build_user_prompt(model_input_text)},
         {"role": "assistant", "content": json.dumps(target_payload, ensure_ascii=False, indent=2)},
     ]
@@ -236,7 +339,7 @@ def split_train_eval_dataset(full_dataset, eval_ratio):
     if eval_ratio <= 0 or len(full_dataset) < 2:
         return full_dataset, None
 
-    split_dataset = full_dataset.train_test_split(test_size=eval_ratio, seed=17)
+    split_dataset = full_dataset.train_test_split(test_size=eval_ratio, seed=config.QWEN_RANDOM_SEED)
     return split_dataset["train"], split_dataset["test"]
 
 
@@ -340,38 +443,24 @@ def build_lora_config(args):
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
+        bias=config.QWEN_LORA_CONFIG["bias"],
+        task_type=config.QWEN_LORA_CONFIG["task_type"],
         target_modules=target_modules,
     )
 
 
 def build_training_args(args):
-    return TrainingArguments(
+    training_arguments = dict(config.QWEN_TRAINING_ARGUMENTS)
+    training_arguments.update(
         output_dir=args.output_dir,
-        num_train_epochs=1,
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=1,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
-        logging_strategy="no",
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        save_total_limit=2,
-        evaluation_strategy="no",
-        save_strategy="no",
-        load_best_model_at_end=False,
-        fp16=True,
-        bf16=False,
-        optim="paged_adamw_8bit",
-        gradient_checkpointing=True,
         eval_accumulation_steps=args.eval_accumulation_steps,
-        remove_unused_columns=True,
-        disable_tqdm=True,
-        report_to=[],
     )
+    return TrainingArguments(**training_arguments)
 
 
 if __name__ == "__main__":

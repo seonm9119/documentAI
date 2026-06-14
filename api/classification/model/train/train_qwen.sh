@@ -2,14 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+MODEL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="${KEY_EMBEDDING_VENV_DIR:-$SCRIPT_DIR/.venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-export HF_HOME="${HF_HOME:-$SCRIPT_DIR/.cache/huggingface}"
+export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
+export HF_HOME="${HF_HOME:-$MODEL_DIR/.cache/huggingface}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME}"
-export DOCUMENT_GRAPH_BASE_MODEL="${DOCUMENT_GRAPH_BASE_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
-export KEY_EMBEDDING_BASE_MODEL="${KEY_EMBEDDING_BASE_MODEL:-$DOCUMENT_GRAPH_BASE_MODEL}"
-export KEY_EMBEDDING_MODEL_NAME="${KEY_EMBEDDING_MODEL_NAME:-key-embedding-graph}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export WANDB_DISABLED="${WANDB_DISABLED:-true}"
@@ -44,9 +44,10 @@ python -m pip install \
 python - <<'PY'
 import os
 import torch
+from api.classification.config import QWEN_BASE_MODEL
 
 print("venv ready")
-print("base model:", os.environ["KEY_EMBEDDING_BASE_MODEL"])
+print("base model:", os.environ.get("KEY_EMBEDDING_BASE_MODEL", QWEN_BASE_MODEL))
 print("cuda available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("cuda device:", torch.cuda.get_device_name(0))
