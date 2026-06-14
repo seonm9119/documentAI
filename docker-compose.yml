@@ -10,12 +10,12 @@ services:
       - DOCUMENT_AI_DATA_DIR=/app/data
       - PADDLE_OCR_API_BASE_URL=http://paddle-ocr:8001
       - QWEN_INFER_API_BASE_URL=http://192.168.0.21:8004
-      - PROJECTION_MODEL_PATH=/app/api/classification/model/train/key_projection_model.pt
+      - PROJECTION_MODEL_PATH=/app/api/classification/model/train/output/key_projection_model.pt
       - PROJECTION_DICTIONARY_DIR=/app/api/classification/dictionary
       - PROJECTION_ENCODER_MODEL=nlpai-lab/KURE-v1
-      - PROJECTION_DEVICE=cuda
+      - PROJECTION_DEVICE=cpu
       - PROJECTION_CACHE_FOLDER=/app/data/model-cache/sentence-transformers
-      - PROJECTION_PRECISION=fp16
+      - PROJECTION_PRECISION=fp32
       - KEY_EMBEDDING_GRAPH_MODEL=nlpai-lab/KURE-v1
       - KEY_EMBEDDING_GRAPH_DEVICE=cuda
       - KEY_EMBEDDING_GRAPH_CACHE_DIR=/app/data/model-cache/sentence-transformers
