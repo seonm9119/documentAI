@@ -42,10 +42,11 @@ def parse_args():
     parser.add_argument("--cache-folder", default=PROJECTION_CACHE_FOLDER)
     parser.add_argument("--device", default=PROJECTION_DEVICE)
     parser.add_argument("--precision", default=PROJECTION_PRECISION)
-    parser.add_argument("--epochs", default=PROJECTION_TRAIN_CONFIG["epochs"], type=int)
     parser.add_argument("--batch-size", default=PROJECTION_TRAIN_CONFIG["batch_size"], type=int)
     parser.add_argument("--samples-per-key", default=PROJECTION_TRAIN_CONFIG["samples_per_key"], type=int)
     parser.add_argument("--lr", default=PROJECTION_TRAIN_CONFIG["lr"], type=float)
+    parser.add_argument("--early-stopping-patience", default=PROJECTION_TRAIN_CONFIG["early_stopping_patience"], type=int)
+    parser.add_argument("--early-stopping-min-delta", default=PROJECTION_TRAIN_CONFIG["early_stopping_min_delta"], type=float)
     return parser.parse_args()
 
 
@@ -59,6 +60,7 @@ def main():
 def train_projection_model(args):
     set_seed(PROJECTION_TRAIN_CONFIG["seed"])
     ensure_cuda_device(args.device)
+    validate_early_stopping_args(args)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,28 +75,58 @@ def train_projection_model(args):
     started_at = time.perf_counter()
     history = []
     best_valid_loss = None
+    best_epoch = None
     best_state = None
+    no_improvement_count = 0
+    stopped_early = False
 
-    for epoch in range(1, int(args.epochs) + 1):
+    epoch = 0
+    while True:
+        epoch += 1
         train_loss = run_epoch(model, optimizer, axis_payloads, args, epoch)
         valid_loss = evaluate_model(model, axis_payloads, args)
         score = valid_loss if valid_loss is not None else train_loss
 
-        if best_valid_loss is None or score < best_valid_loss:
+        improved = best_valid_loss is None or best_valid_loss - score >= float(args.early_stopping_min_delta)
+        if improved:
             best_valid_loss = score
+            best_epoch = epoch
             best_state = {
                 name: value.detach().cpu().clone()
                 for name, value in model.state_dict().items()
             }
+            no_improvement_count = 0
+        else:
+            no_improvement_count += 1
 
         history.append({
             "epoch": epoch,
             "train_loss": round(float(train_loss), 6),
             "valid_loss": None if valid_loss is None else round(float(valid_loss), 6),
+            "best": improved,
+            "stale_epoch_count": no_improvement_count,
         })
 
-        if epoch == 1 or epoch % 10 == 0 or epoch == int(args.epochs):
-            print(f"epoch={epoch} train_loss={train_loss:.5f} valid_loss={format_loss(valid_loss)}", flush=True)
+        print(
+            f"epoch={epoch} "
+            f"train_loss={train_loss:.5f} "
+            f"valid_loss={format_loss(valid_loss)} "
+            f"best={str(improved).lower()} "
+            f"stale={no_improvement_count}/{int(args.early_stopping_patience)}",
+            flush=True,
+        )
+
+        if no_improvement_count >= int(args.early_stopping_patience):
+            stopped_early = True
+            print(
+                "early_stopping "
+                f"epoch={epoch} "
+                f"best_epoch={best_epoch} "
+                f"best_loss={format_loss(best_valid_loss)} "
+                f"patience={int(args.early_stopping_patience)}",
+                flush=True,
+            )
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -108,16 +140,20 @@ def train_projection_model(args):
         "model_config": dict(PROJECTION_MODEL_CONFIG),
         "train_config": {
             **dict(PROJECTION_TRAIN_CONFIG),
-            "epochs": int(args.epochs),
             "batch_size": int(args.batch_size),
             "samples_per_key": int(args.samples_per_key),
             "lr": float(args.lr),
+            "early_stopping_patience": int(args.early_stopping_patience),
+            "early_stopping_min_delta": float(args.early_stopping_min_delta),
         },
         "axis_summary": {
             axis: payload["summary"]
             for axis, payload in axis_payloads.items()
         },
         "best_valid_loss": best_valid_loss,
+        "best_epoch": best_epoch,
+        "completed_epochs": len(history),
+        "stopped_early": stopped_early,
         "elapsed_seconds": round(time.perf_counter() - started_at, 3),
         "history": history,
     }
@@ -204,6 +240,13 @@ def evaluate_model(model, axis_payloads, args):
                 losses.append(float(loss.detach().cpu()))
 
     return float(np.mean(losses)) if losses else None
+
+
+def validate_early_stopping_args(args):
+    if int(args.early_stopping_patience) <= 0:
+        raise ValueError("early_stopping_patience must be positive because training has no epoch limit.")
+    if float(args.early_stopping_min_delta) < 0:
+        raise ValueError("early_stopping_min_delta must be non-negative.")
 
 
 def batch_loss(model, axis, batch_rows, hard_map, device):

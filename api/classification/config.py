@@ -142,10 +142,11 @@ PROJECTION_MODEL_CONFIG = {
 
 PROJECTION_TRAIN_CONFIG = {
     "seed": 17,
-    "epochs": 80,
     "batch_size": 64,
     "samples_per_key": 4,
-    "lr": 0.0003,
+    "lr": 0.0002,
+    "early_stopping_patience": 5,
+    "early_stopping_min_delta": 0.0005,
     "weight_decay": 0.01,
     "valid_ratio": 0.15,
     "temperature": 0.07,
