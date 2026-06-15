@@ -1,4 +1,5 @@
 import json
+from threading import Lock
 from types import SimpleNamespace
 
 import httpx
@@ -40,6 +41,11 @@ from .model.inference import (
 
 
 router = APIRouter()
+_KEY_EMBEDDING_GRAPH_MEMORY_CACHE = {
+    "signature": None,
+    "payload": None,
+}
+_KEY_EMBEDDING_GRAPH_CACHE_LOCK = Lock()
 
 
 @router.post("/qwen-infer")
@@ -71,8 +77,14 @@ async def projection_normalize_signals():
 
 
 @router.post("/key-embedding-graph")
-async def build_key_embedding_graph():
+async def build_key_embedding_graph(refresh: bool = False):
     try:
+        if not refresh:
+            try:
+                return get_cached_key_embedding_graph_payload()
+            except FileNotFoundError:
+                pass
+
         return _build_normalized_key_embedding_graph()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -163,6 +175,28 @@ def _build_normalized_key_embedding_graph():
     return graph_payload
 
 
+def get_cached_key_embedding_graph_payload():
+    if not KEY_EMBEDDING_GRAPH_PATH.exists():
+        raise FileNotFoundError("key_embedding_graph.json을 찾을 수 없습니다.")
+
+    graph_signature = _key_embedding_graph_file_signature()
+
+    with _KEY_EMBEDDING_GRAPH_CACHE_LOCK:
+        if (
+            _KEY_EMBEDDING_GRAPH_MEMORY_CACHE["signature"] == graph_signature and
+            _KEY_EMBEDDING_GRAPH_MEMORY_CACHE["payload"] is not None
+        ):
+            return _KEY_EMBEDDING_GRAPH_MEMORY_CACHE["payload"]
+
+    try:
+        graph_payload = json.loads(KEY_EMBEDDING_GRAPH_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("key_embedding_graph.json 파싱에 실패했습니다.") from exc
+
+    _cache_key_embedding_graph_payload(graph_payload)
+    return graph_payload
+
+
 def _load_projection_graph_assets():
     graph_args = _key_embedding_graph_args()
     embedding_model = load_embedding_model(
@@ -205,7 +239,22 @@ def _update_graph_embedding_metadata(graph_payload):
 
 def _write_key_embedding_graph(graph_payload):
     graph_source = json.dumps(graph_payload, ensure_ascii=False, indent=2)
+    KEY_EMBEDDING_GRAPH_PATH.parent.mkdir(parents=True, exist_ok=True)
     KEY_EMBEDDING_GRAPH_PATH.write_text(graph_source + "\n", encoding="utf-8")
+    _cache_key_embedding_graph_payload(graph_payload)
+
+
+def _cache_key_embedding_graph_payload(graph_payload):
+    graph_signature = _key_embedding_graph_file_signature()
+
+    with _KEY_EMBEDDING_GRAPH_CACHE_LOCK:
+        _KEY_EMBEDDING_GRAPH_MEMORY_CACHE["signature"] = graph_signature
+        _KEY_EMBEDDING_GRAPH_MEMORY_CACHE["payload"] = graph_payload
+
+
+def _key_embedding_graph_file_signature():
+    graph_stat = KEY_EMBEDDING_GRAPH_PATH.stat()
+    return graph_stat.st_mtime_ns, graph_stat.st_size
 
 
 def _service_url(base_url, path):
